@@ -89,6 +89,15 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router
         self.router = TopKRouter(config=self.config)
+        #NEW
+        # RSPO: Router shift ratio module
+        from .router_shift import RouterShiftRatio  
+        self.router_shift_ratio = RouterShiftRatio(
+            num_experts=self.config.num_moe_experts,
+            gamma_min=getattr(self.config, "rspo_gamma_min", 0.1),
+            momentum=getattr(self.config, "rspo_momentum", 0.8),
+        )
+        #NEW
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -145,6 +154,10 @@ class MoELayer(BaseMoELayer):
                 values, indices = torch.topk(probs, k=self.config.moe_router_topk)
                 torch.save((values, indices), Path(self.dump, f"{self.cnts}-{self.rank}.pt"))
                 self.cnts += 1
+
+            # NEW
+            self.last_gamma = self.router_shift_ratio(probs.detach())
+            #NEW
 
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 hidden_states, probs, routing_map
