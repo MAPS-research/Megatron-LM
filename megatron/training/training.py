@@ -1708,6 +1708,23 @@ def training_log(
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
 
+        # Log system RAM usage to detect memory leaks
+        if torch.distributed.get_rank() == 0:
+            try:
+                import psutil
+                proc = psutil.Process()
+                rss_gb = proc.memory_info().rss / 1e9
+                children_rss = sum(
+                    c.memory_info().rss for c in proc.children(recursive=True)
+                )
+                print(
+                    f'[Memory] iteration {iteration} | '
+                    f'process_rss={rss_gb:.1f}GB | '
+                    f'children_rss={children_rss / 1e9:.1f}GB'
+                )
+            except Exception:
+                pass
+
     return report_memory_flag
 
 
@@ -2396,6 +2413,11 @@ def evaluate(
     timers = get_timers()
 
     timers('evaluate', log_level=0).start(barrier=True)
+
+    # Free accumulated garbage before eval to reduce OOM risk
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
 
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         from megatron.legacy.model.vision.knn_monitor import compute_feature_bank
