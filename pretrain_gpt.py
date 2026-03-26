@@ -219,35 +219,125 @@ def get_batch(data_iterator):
 SPIKY_LOSS_FACTOR = 10
 
 
-def _compute_moe_signals(gate_logits, k):
-    """Computes MoE router signals for logging."""
+# Buffer for accumulating per-expert stats between checkpoint saves
+_expert_stats_buffer = []
+_expert_stats_call_count = 0
+
+
+def _save_expert_stats_if_needed(stats_dict, force=False):
+    """Accumulate per-expert stats and save at checkpoint intervals."""
+    global _expert_stats_buffer, _expert_stats_call_count
+    _expert_stats_buffer.append(stats_dict)
+    _expert_stats_call_count += 1
+
+    args = get_args()
+    save_interval = getattr(args, 'save_interval', 1000)
+    log_interval = getattr(args, 'log_interval', 5)
+    # Save when we've accumulated enough micro-batches for one save_interval
+    # Each iteration has (global_batch / (micro_batch * dp)) micro-batches calling this
+    steps_per_save = max(1, save_interval // log_interval)
+    if force or (_expert_stats_call_count % steps_per_save == 0):
+        save_dir = os.path.join(os.environ.get('SSD_WEIGHTS', '.'), 'expert_stats')
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'checkpoint_{_expert_stats_call_count}.pt')
+        torch.save(_expert_stats_buffer, save_path)
+        _expert_stats_buffer = []
+
+
+def _compute_moe_signals(gate_logits, k, token_loss=None, loss_mask=None):
+    """Computes MoE router signals and per-expert metrics.
+
+    Full per-expert stats are accumulated and saved to disk at checkpoint intervals.
+    Only summary stats are returned for wandb/console logging.
+
+    Args:
+        gate_logits: list of [S, B, E] tensors, one per MoE layer
+        k: top-k routing value
+        token_loss: optional [B, S] per-token loss tensor for per-expert loss
+        loss_mask: optional [B*S] mask for valid tokens
+    """
     signals_to_log = {
         'gate_logit_max': [],
         'topk_weight_max': [],
         'entropy': [],
     }
     signals = {}
+    num_layers = len(gate_logits)
+    if num_layers == 0:
+        return signals
 
-    for layer_logits in gate_logits:  # Original shape: [S, B, E]
+    E = gate_logits[0].shape[2]
+
+    # Per-layer per-expert accumulators
+    per_expert_loss = torch.zeros(num_layers, E) if token_loss is not None else None
+    per_expert_routing_freq = torch.zeros(num_layers, E)
+    per_expert_routing_weight = torch.zeros(num_layers, E)
+
+    if token_loss is not None:
+        flat_loss = (token_loss.float().view(-1) * loss_mask).view(-1, 1)  # [N, 1]
+
+    for layer_idx, layer_logits in enumerate(gate_logits):  # Original shape: [S, B, E]
         S, B, E_ = layer_logits.shape
         layer_logits = layer_logits.permute(1, 0, 2).reshape(-1, E_)
-        
-        with torch.no_grad():
-            topv, topi = layer_logits.topk(k, dim=-1)
-            sel_probs = torch.softmax(topv, dim=-1)
+        N = layer_logits.shape[0]
 
+        with torch.no_grad():
+            topv, topi = layer_logits.topk(k, dim=-1)  # [N, k]
+            sel_probs = torch.softmax(topv, dim=-1)     # [N, k]
+
+            # Aggregate signals (existing)
             signals_to_log['gate_logit_max'].append(layer_logits.max())
             signals_to_log['topk_weight_max'].append(sel_probs.max())
-            
+
             log_probs_all = torch.log_softmax(layer_logits, dim=-1)
             probs_all = torch.exp(log_probs_all)
             entropy_layer = -torch.sum(probs_all * log_probs_all, dim=-1).mean()
             signals_to_log['entropy'].append(entropy_layer)
-    
-    # Average signals across layers
+
+            # Per-expert routing frequency: count tokens per expert
+            freq = torch.zeros(E_, device=layer_logits.device)
+            freq.scatter_add_(0, topi.reshape(-1), torch.ones_like(topi.reshape(-1), dtype=freq.dtype))
+            per_expert_routing_freq[layer_idx] = (freq / N).cpu()
+
+            # Per-expert routing weight: sum of softmax weights per expert
+            weight = torch.zeros(E_, device=layer_logits.device)
+            weight.scatter_add_(0, topi.reshape(-1), sel_probs.reshape(-1))
+            per_expert_routing_weight[layer_idx] = (weight / N).cpu()
+
+            # Per-expert loss
+            if token_loss is not None:
+                exp_loss = torch.zeros(E_, device=layer_logits.device)
+                contrib = flat_loss * sel_probs  # [N, k]
+                exp_loss.scatter_add_(0, topi.reshape(-1), contrib.reshape(-1))
+                per_expert_loss[layer_idx] = exp_loss.cpu()
+
+    # Average aggregate signals across layers
     for key in signals_to_log:
         signals[key] = torch.mean(torch.stack(signals_to_log[key])).item() if signals_to_log[key] else 0.0
-            
+
+    # --- Summary stats for wandb/console ---
+    # Per-layer worst (lowest) expert routing probability
+    for l in range(num_layers):
+        signals[f'worst_expert_prob_layer_{l}'] = per_expert_routing_freq[l].min().item()
+    # Average expert routing probability across all layers
+    signals['avg_expert_prob'] = per_expert_routing_freq.mean().item()
+
+    if token_loss is not None:
+        # Per-layer worst (highest) expert loss
+        for l in range(num_layers):
+            signals[f'worst_expert_loss_layer_{l}'] = per_expert_loss[l].max().item()
+        # Average expert loss across all layers
+        signals['avg_expert_loss'] = per_expert_loss.mean().item()
+
+    # --- Save full per-expert stats to disk ---
+    stats_to_save = {
+        'per_expert_routing_freq': per_expert_routing_freq,     # [num_layers, E]
+        'per_expert_routing_weight': per_expert_routing_weight,  # [num_layers, E]
+    }
+    if token_loss is not None:
+        stats_to_save['per_expert_loss'] = per_expert_loss       # [num_layers, E]
+    _save_expert_stats_if_needed(stats_to_save)
+
     return signals
 
 
@@ -310,7 +400,10 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, gate_logits=
 
     metrics = {'lm loss': (reporting_loss[0], reporting_loss[1])}
     if args.num_experts > 0 and getattr(args, 'log_moe_signals', False) and gate_logits:
-        moe_signals = _compute_moe_signals(gate_logits, args.moe_router_topk)
+        moe_signals = _compute_moe_signals(
+            gate_logits, args.moe_router_topk,
+            token_loss=losses, loss_mask=loss_mask,
+        )
         for key, value in moe_signals.items():
             metrics[f'moe/{key}'] = (torch.tensor(value, device=loss.device), 1)
 

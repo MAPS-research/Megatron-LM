@@ -54,6 +54,29 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 
 stimer = StragglerDetector()
 
+# Buffer for accumulating per-expert stats between checkpoint saves
+_expert_stats_buffer = []
+_expert_stats_call_count = 0
+
+
+def _save_expert_stats_if_needed(stats_dict, force=False):
+    """Accumulate per-expert stats and save at checkpoint intervals."""
+    global _expert_stats_buffer, _expert_stats_call_count
+    _expert_stats_buffer.append(stats_dict)
+    _expert_stats_call_count += 1
+
+    args = get_args()
+    save_interval = getattr(args, 'save_interval', 1000)
+    log_interval = getattr(args, 'log_interval', 5)
+    steps_per_save = max(1, save_interval // log_interval)
+    if force or (_expert_stats_call_count % steps_per_save == 0):
+        save_dir = os.path.join(os.environ.get('SSD_WEIGHTS', '.'), 'expert_stats')
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'checkpoint_{_expert_stats_call_count}.pt')
+        torch.save(_expert_stats_buffer, save_path)
+        _expert_stats_buffer = []
+
+
 # DRO constants
 SPIKY_LOSS_FACTOR = 10
 
@@ -745,6 +768,46 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, gate_logits=
         # Format for logging
         for key, value in dro_signals.items():
             metrics[f'dro/{key}'] = (torch.tensor(value, device=loss.device), 1)
+
+        # Per-expert metrics from DRO per_exp and gate_logits
+        with torch.no_grad():
+            num_layers = len(gate_logits)
+            E = args.num_experts
+
+            per_exp_cpu = per_exp.detach().cpu()
+
+            # Per-expert routing frequency and weight from gate_logits
+            per_expert_routing_freq = torch.zeros(num_layers, E)
+            per_expert_routing_weight = torch.zeros(num_layers, E)
+            for layer_idx, layer_logits in enumerate(gate_logits):
+                S, B, E_ = layer_logits.shape
+                flat_logits = layer_logits.permute(1, 0, 2).reshape(-1, E_)
+                N = flat_logits.shape[0]
+                topv, topi = flat_logits.topk(k, dim=-1)
+                sel_probs = torch.softmax(topv, dim=-1)
+
+                freq = torch.zeros(E_, device=flat_logits.device)
+                freq.scatter_add_(0, topi.reshape(-1), torch.ones_like(topi.reshape(-1), dtype=freq.dtype))
+                per_expert_routing_freq[layer_idx] = (freq / N).cpu()
+
+                weight = torch.zeros(E_, device=flat_logits.device)
+                weight.scatter_add_(0, topi.reshape(-1), sel_probs.reshape(-1))
+                per_expert_routing_weight[layer_idx] = (weight / N).cpu()
+
+            # Summary stats for wandb/console
+            for l in range(num_layers):
+                metrics[f'moe/worst_expert_prob_layer_{l}'] = (torch.tensor(per_expert_routing_freq[l].min().item(), device=loss.device), 1)
+                metrics[f'moe/worst_expert_loss_layer_{l}'] = (torch.tensor(per_exp_cpu[l].max().item(), device=loss.device), 1)
+            metrics['moe/avg_expert_prob'] = (torch.tensor(per_expert_routing_freq.mean().item(), device=loss.device), 1)
+            metrics['moe/avg_expert_loss'] = (torch.tensor(per_exp_cpu.mean().item(), device=loss.device), 1)
+
+            # Save full per-expert stats to disk
+            stats_to_save = {
+                'per_expert_loss': per_exp_cpu,
+                'per_expert_routing_freq': per_expert_routing_freq,
+                'per_expert_routing_weight': per_expert_routing_weight,
+            }
+            _save_expert_stats_if_needed(stats_to_save)
 
     # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
     # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
