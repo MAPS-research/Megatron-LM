@@ -1199,6 +1199,24 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
 
+        # Host RAM tracking to detect leaks / save-time spikes (rank 0 only).
+        if torch.distributed.get_rank() == 0:
+            try:
+                import psutil
+                proc = psutil.Process()
+                rss_gb = proc.memory_info().rss / 1e9
+                children_rss = sum(
+                    c.memory_info().rss for c in proc.children(recursive=True)
+                )
+                print(
+                    f'[Memory] iteration {iteration} | '
+                    f'process_rss={rss_gb:.1f}GB | '
+                    f'children_rss={children_rss / 1e9:.1f}GB',
+                    flush=True,
+                )
+            except Exception:
+                pass
+
     return report_memory_flag
 
 
@@ -1264,10 +1282,28 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    # Free host/device memory before the distributed-checkpoint serialization spike.
+    # The torch_dist save buffers shards in host RAM; on memory-capped nodes the
+    # baseline + save spike can exceed the cgroup limit and OOM-kill the step.
+    import gc as _gc
+    _gc.collect()
+    torch.cuda.empty_cache()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
                     non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict)
+    # Release the serialization buffers before training resumes.
+    _gc.collect()
+    torch.cuda.empty_cache()
+    # gc.collect() frees the Python objects, but glibc keeps the freed pages in its
+    # allocator arena instead of returning them to the OS, so RSS stays elevated
+    # after every save and creeps toward the cgroup cap. malloc_trim(0) forces glibc
+    # to hand the pages back, keeping host RSS flat across saves.
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
